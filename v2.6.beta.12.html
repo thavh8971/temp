@@ -9477,6 +9477,29 @@ Thạch Anh Sigma
         };
       }
 
+      function hasNesMidiEnvelopeTuning(voice) {
+        return ["attack", "decay", "sustain", "release"].some((key) =>
+          Number.isFinite(Number(voice?.[key]))
+        );
+      }
+
+      function adaptNesNativeEnvelopeToMidiHold(voice, nativeSpec = {}) {
+        if (!hasNesMidiEnvelopeTuning(voice)) {
+          return nativeSpec;
+        }
+        const nativeModel = String(nativeSpec.nativeModel || "CHIP_GATE");
+        if (nativeModel === "SID_6581_ADSR_RATE_TABLE" || nativeModel === "VRC7_OPLL_OPERATOR_ADSR") {
+          return nativeSpec;
+        }
+        const adapted = getNesSoftwareVolumeEnvelopeSpec(voice, nativeSpec);
+        return {
+          ...adapted,
+          nativeModel: `${nativeModel}+MIDI_PROGRAM_ADSR_ADAPTER`,
+          sourceTier: `${nativeSpec.sourceTier || "CHIP_NATIVE_GATE"} + MIDI_PROGRAM_ENVELOPE`,
+          chipEnvelope: nativeSpec,
+        };
+      }
+
       function getNesApuNativeEnvelopeSpec(voice, frequency = 440) {
         if (voice?.kind === "triangle") {
           return {
@@ -9570,10 +9593,16 @@ Thạch Anh Sigma
       }
 
       function getNesHardwareEnvelopeSpec(voice, duration = 0, frequency = 440) {
-        if (voice?.chip === "2A03 APU") return getNesApuNativeEnvelopeSpec(voice, frequency);
+        if (voice?.chip === "2A03 APU") {
+          return adaptNesNativeEnvelopeToMidiHold(voice, getNesApuNativeEnvelopeSpec(voice, frequency));
+        }
         if (voice?.chip === "VRC7" && voice?.kind === "fm") return getNesVrc7EnvelopeSpec(voice);
-        if (voice?.chip === "FDS") return getNesFdsNativeEnvelopeSpec(voice, frequency);
-        if (voice?.chip === "S5B") return getNesS5bNativeEnvelopeSpec(voice, frequency);
+        if (voice?.chip === "FDS") {
+          return adaptNesNativeEnvelopeToMidiHold(voice, getNesFdsNativeEnvelopeSpec(voice, frequency));
+        }
+        if (voice?.chip === "S5B") {
+          return adaptNesNativeEnvelopeToMidiHold(voice, getNesS5bNativeEnvelopeSpec(voice, frequency));
+        }
         if (voice?.kind === "sid" || voice?.chip === "SID 6581") return getNesSidEnvelopeSpec(voice);
         if (voice?.kind === "noise" || voice?.kind === "psg-noise") {
           return getNesSoftwareVolumeEnvelopeSpec(voice, { attack: 0.001, decay: Math.max(0.001, Math.min(duration, 0.05)), sustain: 0.14, release: 0 });
@@ -12591,6 +12620,7 @@ Thạch Anh Sigma
             entry.instrumentSpec = getBuildInstrumentSpec(entry.track, entry.note, entry.controls, entry.sourceChannel, entry.nesIntent);
             entry.nesMonoSourceKey = makeNesMonoSourceKey(entry);
           });
+          markNesMidiDurationPreservation(noteEntries);
           activeNoteEntries = collapseNesChordEntriesToRepresentatives(noteEntries);
           applyNesSourceMonophony(activeNoteEntries);
           assignNesPolyphonyEntryChannels(activeNoteEntries);
@@ -13177,6 +13207,17 @@ Thạch Anh Sigma
         return 1;
       }
 
+      function getNesRepresentativeHoldScore(entry, role, isBacking) {
+        const duration = getNesEntryDuration(entry);
+        const voice = entry?.instrumentSpec?.voice;
+        const envelope = getNesHardwareEnvelopeSpec(voice, duration, midiToFrequency(getNesEntryEffectiveMidi(entry)));
+        const sustain = clamp(Number(envelope?.sustain ?? voice?.sustain ?? 1), 0, 1);
+        const gain = clamp(Number(voice?.gain ?? 0.7), 0.05, 1.25);
+        const holdSeconds = clamp(duration - Math.max(0, Number(envelope?.attack) || 0), 0, 6);
+        const roleWeight = isBacking ? 0.95 : role === "melodic" ? 0.72 : 0.5;
+        return holdSeconds * sustain * gain * roleWeight;
+      }
+
       function scoreNesRepresentativeEntry(entry, entries, previousMidi = null, slotInfo = null) {
         const midi = getNesEntryEffectiveMidi(entry);
         const intent = getNesEntryIntent(entry);
@@ -13264,8 +13305,9 @@ Thạch Anh Sigma
         } else if (role === "melodic") {
           score += 0.35;
         } else if (role === "backing") {
-          score -= 0.15;
+          score += 0.15;
         }
+        score += getNesRepresentativeHoldScore(entry, role, isBacking);
         score -= (entry.sourceOrder ?? 0) * 0.00001;
         return score;
       }
@@ -13473,6 +13515,44 @@ Thạch Anh Sigma
         return representativesByCluster;
       }
 
+      function isNesMidiDurationPreserveCandidate(entry) {
+        if (entry?.instrumentSpec?.type !== "nes" || entry?.controls?.percussion || entry?.instrumentSpec?.percussion || entry?.note?.legacyOneShot) {
+          return false;
+        }
+        const duration = getNesEntryDuration(entry);
+        if (duration < NES_SIMULTANEOUS_NOTE_WINDOW_SECONDS) {
+          return false;
+        }
+        const voice = entry?.instrumentSpec?.voice;
+        const laneGroup = getNesLaneGroup(voice);
+        return laneGroup !== "noise" && laneGroup !== "psg-noise" && laneGroup !== "dmc" && laneGroup !== "pcm";
+      }
+
+      function markNesMidiDurationPreservation(entries) {
+        const groups = new Map();
+        entries.forEach((entry) => {
+          if (!isNesMidiDurationPreserveCandidate(entry)) {
+            return;
+          }
+          entry.nesPreserveMidiDuration = true;
+          const key = getNesMonoSourceKey(entry);
+          if (!groups.has(key)) groups.set(key, []);
+          groups.get(key).push(entry);
+        });
+
+        groups.forEach((groupEntries) => {
+          buildNesRepresentativeClusters(groupEntries).forEach((chord) => {
+            if (chord.length <= 1) {
+              return;
+            }
+            const spreadPlan = getNesFullChordSpreadPlan(chord);
+            if (spreadPlan && spreadPlan.length >= chord.length) {
+              applyNesFullChordSpreadVoices(chord, chord);
+            }
+          });
+        });
+      }
+
       function collapseNesChordEntriesToRepresentatives(entries) {
         const groups = new Map();
         entries.forEach((entry) => {
@@ -13489,6 +13569,9 @@ Thạch Anh Sigma
           const clusters = buildNesRepresentativeClusters(groupEntries);
           const representativesByCluster = chooseNesRepresentativePathsForClusters(clusters);
           clusters.forEach((chord, index) => {
+            if (chord.some((entry) => entry.nesPreserveMidiDuration)) {
+              return;
+            }
             const representatives = representativesByCluster[index];
             if (!representatives.length) return;
             if (chord.length > 1) {
@@ -13508,7 +13591,7 @@ Thạch Anh Sigma
     function applyNesSourceMonophony(entries) {
         const groups = new Map();
         entries.forEach((entry) => {
-          if (entry.instrumentSpec?.type !== "nes" || entry.controls?.percussion) return;
+          if (entry.instrumentSpec?.type !== "nes" || entry.controls?.percussion || entry.nesPreserveMidiDuration) return;
           
           // SỬA TẠI ĐÂY: Chỉ ép đơn âm cho các bè đơn âm thực sự (lead, mainLead, bass)
           // Các bè đệm (backing) hoặc giai điệu tự do (melodic) cần được giữ nguyên đa âm 
@@ -13546,7 +13629,7 @@ Thạch Anh Sigma
         entries.forEach((entry) => {
           if (entry.instrumentSpec?.type !== "nes") return;
 
-          if (entry.note?.legacyOneShot) return;
+          if (entry.note?.legacyOneShot || entry.nesPreserveMidiDuration) return;
           const lane = getEventOutputChannel({ ...entry, instrumentSpec: entry.instrumentSpec, outputChannel: entry.outputChannel });
           if (!byLane.has(lane)) byLane.set(lane, []);
           byLane.get(lane).push(entry);
