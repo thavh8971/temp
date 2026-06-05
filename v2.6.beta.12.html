@@ -4024,6 +4024,99 @@ Thạch Anh Sigma
         ctx.shadowBlur = 0;
       }
 
+      function isScopeVrc7Channel(scopeChannel) {
+        return isNesMidiSourceActive() && getNesChipLaneInfo(scopeChannel - 1).chip === "VRC7";
+      }
+
+      function estimateScopeTriggerPeriod(scopeChannel, triggers, minPeriod, maxPeriod) {
+        const recent = triggers.slice(-96);
+        if (recent.length < 2) {
+          return NaN;
+        }
+        const traceState = getScopeTraceState(scopeChannel);
+        const previous = Number(traceState.triggerPeriod);
+        const vrc7 = isScopeVrc7Channel(scopeChannel);
+        let bestPeriod = NaN;
+        let bestScore = -Infinity;
+        for (let i = 0; i < recent.length - 1; i += 1) {
+          for (let j = i + 1; j < recent.length; j += 1) {
+            const period = recent[j] - recent[i];
+            if (period < minPeriod) {
+              continue;
+            }
+            if (period > maxPeriod) {
+              break;
+            }
+            let score = 1;
+            if (vrc7) {
+              score *= Math.pow(period / minPeriod, 0.42);
+            }
+            if (Number.isFinite(previous) && previous >= minPeriod) {
+              const normalizedDistance = Math.abs(period - previous) / Math.max(previous, minPeriod);
+              score *= 1 + Math.max(0, 1 - normalizedDistance * 2.5) * 2.4;
+            }
+            for (let k = j + 1; k < recent.length; k += 1) {
+              const multiple = Math.round((recent[k] - recent[i]) / period);
+              if (multiple < 2) {
+                continue;
+              }
+              const expected = recent[i] + multiple * period;
+              const tolerance = Math.max(2.5, period * (vrc7 ? 0.045 : 0.07));
+              if (Math.abs(recent[k] - expected) <= tolerance) {
+                score += 1 / Math.sqrt(multiple);
+              }
+            }
+            if (score > bestScore) {
+              bestScore = score;
+              bestPeriod = period;
+            }
+          }
+        }
+        return bestScore > 1 ? bestPeriod : NaN;
+      }
+
+      function chooseScopeStableTrigger(scopeChannel, triggers, latestStart) {
+        if (!triggers.length) {
+          return null;
+        }
+        const traceState = getScopeTraceState(scopeChannel);
+        const sampleRate = state.audioContext?.sampleRate || 44100;
+        const minPeriod = Math.max(4, sampleRate / 8000);
+        const maxPeriod = Math.max(minPeriod + 1, sampleRate / 18);
+        const estimatedPeriod = estimateScopeTriggerPeriod(scopeChannel, triggers, minPeriod, maxPeriod);
+        if (Number.isFinite(estimatedPeriod)) {
+          const previous = Number(traceState.triggerPeriod);
+          traceState.triggerPeriod = Number.isFinite(previous)
+            ? previous * 0.86 + estimatedPeriod * 0.14
+            : estimatedPeriod;
+        }
+
+        let chosen = triggers[triggers.length - 1];
+        let previousTrigger = Number(traceState.triggerIndex);
+        const period = Number(traceState.triggerPeriod);
+        if (Number.isFinite(previousTrigger) && Number.isFinite(period) && period >= minPeriod) {
+          const ringSize = state.scope.ringSize || 32768;
+          while (previousTrigger - latestStart > ringSize * 0.5) previousTrigger -= ringSize;
+          while (latestStart - previousTrigger > ringSize * 0.5) previousTrigger += ringSize;
+          const steps = Math.max(1, Math.round((latestStart - previousTrigger) / period));
+          const predicted = previousTrigger + steps * period;
+          let best = chosen;
+          let bestDistance = Math.abs(chosen - predicted);
+          for (const trigger of triggers) {
+            const distance = Math.abs(trigger - predicted);
+            if (distance < bestDistance) {
+              best = trigger;
+              bestDistance = distance;
+            }
+          }
+          if (bestDistance <= Math.max(3, period * 0.35)) {
+            chosen = best;
+          }
+        }
+        traceState.triggerIndex = chosen;
+        return chosen;
+      }
+
       function findScopeRingTraceStart(scopeChannel, latestStart, sampleCount) {
         const ring = state.scope.ring;
         const ringSize = state.scope.ringSize;
@@ -4051,12 +4144,13 @@ Thạch Anh Sigma
         if (peak < 0.001) {
           return latestStart;
         }
-        const threshold = Math.max(0.001, peak * 0.08);
+        const thresholdRatio = isScopeVrc7Channel(scopeChannel) ? 0.22 : 0.11;
+        const threshold = Math.max(0.001, peak * thresholdRatio);
         const lowThreshold = center - threshold;
         const highThreshold = center + threshold;
+        const triggers = [];
         let prev = read(0);
         let armed = prev <= lowThreshold;
-        let trigger = null;
         for (let offset = 1; offset <= searchLength; offset++) {
           const current = offset < searchLength ? read(offset) : read(searchLength - 1);
           if (current <= lowThreshold) {
@@ -4065,27 +4159,30 @@ Thạch Anh Sigma
           if (armed && prev < highThreshold && current >= highThreshold) {
             const span = current - prev;
             const frac = Math.abs(span) > 1e-9 ? clamp((highThreshold - prev) / span, 0, 1) : 0;
-            trigger = searchStart + offset - 1 + frac;
+            triggers.push(searchStart + offset - 1 + frac);
             armed = false;
           }
           prev = current;
         }
-        if (trigger !== null) {
-          return trigger;
+        const stableTrigger = chooseScopeStableTrigger(scopeChannel, triggers, latestStart);
+        if (stableTrigger !== null) {
+          return stableTrigger;
         }
 
+        const centerTriggers = [];
         prev = read(0);
         for (let offset = 1; offset < searchLength; offset++) {
           const current = read(offset);
           if (prev <= center && current > center) {
             const span = current - prev;
             const frac = Math.abs(span) > 1e-9 ? clamp((center - prev) / span, 0, 1) : 0;
-            trigger = searchStart + offset - 1 + frac;
+            centerTriggers.push(searchStart + offset - 1 + frac);
           }
           prev = current;
         }
-        if (trigger !== null) {
-          return trigger;
+        const fallbackTrigger = chooseScopeStableTrigger(scopeChannel, centerTriggers, latestStart);
+        if (fallbackTrigger !== null) {
+          return fallbackTrigger;
         }
         return latestStart;
       }
@@ -9477,6 +9574,29 @@ Thạch Anh Sigma
         };
       }
 
+      function hasNesMidiEnvelopeTuning(voice) {
+        return ["attack", "decay", "sustain", "release"].some((key) =>
+          Number.isFinite(Number(voice?.[key]))
+        );
+      }
+
+      function adaptNesNativeEnvelopeToMidiHold(voice, nativeSpec = {}) {
+        if (!hasNesMidiEnvelopeTuning(voice)) {
+          return nativeSpec;
+        }
+        const nativeModel = String(nativeSpec.nativeModel || "CHIP_GATE");
+        if (nativeModel === "SID_6581_ADSR_RATE_TABLE" || nativeModel === "VRC7_OPLL_OPERATOR_ADSR") {
+          return nativeSpec;
+        }
+        const adapted = getNesSoftwareVolumeEnvelopeSpec(voice, nativeSpec);
+        return {
+          ...adapted,
+          nativeModel: `${nativeModel}+MIDI_PROGRAM_ADSR_ADAPTER`,
+          sourceTier: `${nativeSpec.sourceTier || "CHIP_NATIVE_GATE"} + MIDI_PROGRAM_ENVELOPE`,
+          chipEnvelope: nativeSpec,
+        };
+      }
+
       function getNesApuNativeEnvelopeSpec(voice, frequency = 440) {
         if (voice?.kind === "triangle") {
           return {
@@ -9570,10 +9690,16 @@ Thạch Anh Sigma
       }
 
       function getNesHardwareEnvelopeSpec(voice, duration = 0, frequency = 440) {
-        if (voice?.chip === "2A03 APU") return getNesApuNativeEnvelopeSpec(voice, frequency);
+        if (voice?.chip === "2A03 APU") {
+          return adaptNesNativeEnvelopeToMidiHold(voice, getNesApuNativeEnvelopeSpec(voice, frequency));
+        }
         if (voice?.chip === "VRC7" && voice?.kind === "fm") return getNesVrc7EnvelopeSpec(voice);
-        if (voice?.chip === "FDS") return getNesFdsNativeEnvelopeSpec(voice, frequency);
-        if (voice?.chip === "S5B") return getNesS5bNativeEnvelopeSpec(voice, frequency);
+        if (voice?.chip === "FDS") {
+          return adaptNesNativeEnvelopeToMidiHold(voice, getNesFdsNativeEnvelopeSpec(voice, frequency));
+        }
+        if (voice?.chip === "S5B") {
+          return adaptNesNativeEnvelopeToMidiHold(voice, getNesS5bNativeEnvelopeSpec(voice, frequency));
+        }
         if (voice?.kind === "sid" || voice?.chip === "SID 6581") return getNesSidEnvelopeSpec(voice);
         if (voice?.kind === "noise" || voice?.kind === "psg-noise") {
           return getNesSoftwareVolumeEnvelopeSpec(voice, { attack: 0.001, decay: Math.max(0.001, Math.min(duration, 0.05)), sustain: 0.14, release: 0 });
@@ -12591,6 +12717,7 @@ Thạch Anh Sigma
             entry.instrumentSpec = getBuildInstrumentSpec(entry.track, entry.note, entry.controls, entry.sourceChannel, entry.nesIntent);
             entry.nesMonoSourceKey = makeNesMonoSourceKey(entry);
           });
+          markNesMidiDurationPreservation(noteEntries);
           activeNoteEntries = collapseNesChordEntriesToRepresentatives(noteEntries);
           applyNesSourceMonophony(activeNoteEntries);
           assignNesPolyphonyEntryChannels(activeNoteEntries);
@@ -13177,6 +13304,17 @@ Thạch Anh Sigma
         return 1;
       }
 
+      function getNesRepresentativeHoldScore(entry, role, isBacking) {
+        const duration = getNesEntryDuration(entry);
+        const voice = entry?.instrumentSpec?.voice;
+        const envelope = getNesHardwareEnvelopeSpec(voice, duration, midiToFrequency(getNesEntryEffectiveMidi(entry)));
+        const sustain = clamp(Number(envelope?.sustain ?? voice?.sustain ?? 1), 0, 1);
+        const gain = clamp(Number(voice?.gain ?? 0.7), 0.05, 1.25);
+        const holdSeconds = clamp(duration - Math.max(0, Number(envelope?.attack) || 0), 0, 6);
+        const roleWeight = isBacking ? 0.95 : role === "melodic" ? 0.72 : 0.5;
+        return holdSeconds * sustain * gain * roleWeight;
+      }
+
       function scoreNesRepresentativeEntry(entry, entries, previousMidi = null, slotInfo = null) {
         const midi = getNesEntryEffectiveMidi(entry);
         const intent = getNesEntryIntent(entry);
@@ -13264,8 +13402,9 @@ Thạch Anh Sigma
         } else if (role === "melodic") {
           score += 0.35;
         } else if (role === "backing") {
-          score -= 0.15;
+          score += 0.15;
         }
+        score += getNesRepresentativeHoldScore(entry, role, isBacking);
         score -= (entry.sourceOrder ?? 0) * 0.00001;
         return score;
       }
@@ -13473,6 +13612,44 @@ Thạch Anh Sigma
         return representativesByCluster;
       }
 
+      function isNesMidiDurationPreserveCandidate(entry) {
+        if (entry?.instrumentSpec?.type !== "nes" || entry?.controls?.percussion || entry?.instrumentSpec?.percussion || entry?.note?.legacyOneShot) {
+          return false;
+        }
+        const duration = getNesEntryDuration(entry);
+        if (duration < NES_SIMULTANEOUS_NOTE_WINDOW_SECONDS) {
+          return false;
+        }
+        const voice = entry?.instrumentSpec?.voice;
+        const laneGroup = getNesLaneGroup(voice);
+        return laneGroup !== "noise" && laneGroup !== "psg-noise" && laneGroup !== "dmc" && laneGroup !== "pcm";
+      }
+
+      function markNesMidiDurationPreservation(entries) {
+        const groups = new Map();
+        entries.forEach((entry) => {
+          if (!isNesMidiDurationPreserveCandidate(entry)) {
+            return;
+          }
+          entry.nesPreserveMidiDuration = true;
+          const key = getNesMonoSourceKey(entry);
+          if (!groups.has(key)) groups.set(key, []);
+          groups.get(key).push(entry);
+        });
+
+        groups.forEach((groupEntries) => {
+          buildNesRepresentativeClusters(groupEntries).forEach((chord) => {
+            if (chord.length <= 1) {
+              return;
+            }
+            const spreadPlan = getNesFullChordSpreadPlan(chord);
+            if (spreadPlan && spreadPlan.length >= chord.length) {
+              applyNesFullChordSpreadVoices(chord, chord);
+            }
+          });
+        });
+      }
+
       function collapseNesChordEntriesToRepresentatives(entries) {
         const groups = new Map();
         entries.forEach((entry) => {
@@ -13489,6 +13666,9 @@ Thạch Anh Sigma
           const clusters = buildNesRepresentativeClusters(groupEntries);
           const representativesByCluster = chooseNesRepresentativePathsForClusters(clusters);
           clusters.forEach((chord, index) => {
+            if (chord.some((entry) => entry.nesPreserveMidiDuration)) {
+              return;
+            }
             const representatives = representativesByCluster[index];
             if (!representatives.length) return;
             if (chord.length > 1) {
@@ -13508,7 +13688,7 @@ Thạch Anh Sigma
     function applyNesSourceMonophony(entries) {
         const groups = new Map();
         entries.forEach((entry) => {
-          if (entry.instrumentSpec?.type !== "nes" || entry.controls?.percussion) return;
+          if (entry.instrumentSpec?.type !== "nes" || entry.controls?.percussion || entry.nesPreserveMidiDuration) return;
           
           // SỬA TẠI ĐÂY: Chỉ ép đơn âm cho các bè đơn âm thực sự (lead, mainLead, bass)
           // Các bè đệm (backing) hoặc giai điệu tự do (melodic) cần được giữ nguyên đa âm 
@@ -13546,7 +13726,7 @@ Thạch Anh Sigma
         entries.forEach((entry) => {
           if (entry.instrumentSpec?.type !== "nes") return;
 
-          if (entry.note?.legacyOneShot) return;
+          if (entry.note?.legacyOneShot || entry.nesPreserveMidiDuration) return;
           const lane = getEventOutputChannel({ ...entry, instrumentSpec: entry.instrumentSpec, outputChannel: entry.outputChannel });
           if (!byLane.has(lane)) byLane.set(lane, []);
           byLane.get(lane).push(entry);
